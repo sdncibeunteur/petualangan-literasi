@@ -345,6 +345,10 @@ const DB = {
   },
 
   async getAll(storeName) {
+    // Buku memakai penyimpanan server agar katalog sama di perangkat admin dan siswa.
+    if (storeName === 'books' && location.protocol !== 'file:') {
+      try { const r = await fetch('/api/books', { cache: 'no-store' }); if (r.ok) return await r.json(); } catch (e) { console.warn('API buku tidak tersedia; memakai penyimpanan lokal.', e); }
+    }
     if (!this.db) {
       const data = localStorage.getItem(`db_${storeName}`);
       return data ? JSON.parse(data) : [];
@@ -359,6 +363,9 @@ const DB = {
   },
 
   async get(storeName, key) {
+    if (storeName === 'books' && location.protocol !== 'file:') {
+      try { const list = await this.getAll('books'); return list.find(item => item.id === key) || null; } catch (e) {}
+    }
     if (!this.db) {
       const list = await this.getAll(storeName);
       return list.find(item => (item.id || item.key) === key) || null;
@@ -373,6 +380,11 @@ const DB = {
   },
 
   async put(storeName, item) {
+    if (storeName === 'books' && location.protocol !== 'file:') {
+      const r = await fetch('/api/books/' + encodeURIComponent(item.id), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Gagal menyimpan buku ke server');
+      return await r.json();
+    }
     if (!this.db) {
       const list = await this.getAll(storeName);
       const idx = list.findIndex(i => (i.id || i.key) === (item.id || item.key));
@@ -391,6 +403,11 @@ const DB = {
   },
 
   async delete(storeName, key) {
+    if (storeName === 'books' && location.protocol !== 'file:') {
+      const r = await fetch('/api/books/' + encodeURIComponent(key), { method: 'DELETE' });
+      if (!r.ok) throw new Error('Gagal menghapus buku dari server');
+      return true;
+    }
     if (!this.db) {
       let list = await this.getAll(storeName);
       list = list.filter(i => (i.id || i.key) !== key);
@@ -2010,7 +2027,7 @@ const app = {
     this.openModal('modal-upload-book');
   },
 
-  // STORE FULL REAL PDF DATA IN INDEXEDDB (NO SIZE LIMITS)
+  // Upload buku ke server bersama agar buku tampil pada perangkat siswa juga.
   async handleBookUpload(e) {
     e.preventDefault();
     const title = document.getElementById('book-title').value.trim();
@@ -2020,62 +2037,46 @@ const app = {
     const iconChoice = document.getElementById('cover-icon-select').value;
     const fileInput = document.getElementById('book-file');
     const file = this.selectedBookFile || (fileInput && fileInput.files ? fileInput.files[0] : null);
-
-    let coverImage = this.uploadedCustomCover;
-    if (!coverImage) {
-      const canvas = document.getElementById('cover-canvas');
-      coverImage = canvas.toDataURL('image/jpeg', 0.85);
+    if (location.protocol === 'file:') {
+      this.showToast('Aplikasi harus dijalankan melalui server (npm start), bukan dengan membuka index.html langsung.', 'error');
+      return;
     }
-
-    let pdfData = null;
-    let fileName = `${title.toLowerCase().replace(/\s+/g, '_')}.pdf`;
-    let fileSize = '5.0 MB';
-    let isSynthetic = true;
-
-    if (file) {
-      fileName = file.name;
-      fileSize = `${(file.size / (1024 * 1024)).toFixed(1)} MB`;
-      this.showToast('Menyimpan berkas PDF asli ke perpustakaan...', 'info');
-      pdfData = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (ev) => resolve(ev.target.result);
-        reader.onerror = (err) => reject(err);
-        reader.readAsDataURL(file);
-      });
-      isSynthetic = false;
-    } else {
-      pdfData = PdfSynthesizer.createMultiPagePdf(title, author, category, points);
-      isSynthetic = true;
+    if (file && file.size > 100 * 1024 * 1024) {
+      this.showToast('Ukuran PDF maksimal 100 MB.', 'error'); return;
     }
-
-    const newBook = {
-      id: 'book_' + Date.now(),
-      title,
-      author,
-      category,
-      points,
-      fileName,
-      fileSize,
-      coverImage,
-      pdfData,
-      isSynthetic,
-      paletteIndex: this.selectedPaletteIndex,
-      icon: iconChoice,
-      readsCount: 0,
-      createdAt: new Date().toISOString()
-    };
-
-    await DB.put('books', newBook);
-    this.selectedBookFile = null;
-
-    SoundFx.playSuccess();
-    this.closeModal('modal-upload-book');
-    this.showToast(`E-Book "${title}" berhasil diunggah dengan berkas PDF asli (+${points} XP)!`, 'success');
-
-    if (this.currentView === 'admin') {
-      this.renderAdminDashboard(document.getElementById('main-content'));
-    } else {
-      this.navigate('library');
+    if (file && file.type && file.type !== 'application/pdf') {
+      this.showToast('Silakan pilih file PDF yang valid.', 'error'); return;
+    }
+    const submitBtn = document.querySelector('#form-upload-book button[type="submit"]');
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Menyimpan buku...'; }
+    try {
+      let coverImage = this.uploadedCustomCover;
+      if (!coverImage) coverImage = document.getElementById('cover-canvas').toDataURL('image/jpeg', 0.85);
+      const book = {
+        id: 'book_' + Date.now(), title, author, category, points,
+        fileName: file ? file.name : `${title.toLowerCase().replace(/\s+/g, '_')}.pdf`,
+        fileSize: file ? `${(file.size / (1024 * 1024)).toFixed(1)} MB` : 'PDF otomatis',
+        coverImage, pdfData: file ? null : PdfSynthesizer.createMultiPagePdf(title, author, category, points),
+        isSynthetic: !file, paletteIndex: this.selectedPaletteIndex, icon: iconChoice,
+        readsCount: 0, createdAt: new Date().toISOString()
+      };
+      const form = new FormData();
+      form.append('book', JSON.stringify(book));
+      if (file) form.append('pdf', file, file.name);
+      const response = await fetch('/api/books/upload', { method: 'POST', body: form });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Server gagal menyimpan buku.');
+      this.selectedBookFile = null;
+      SoundFx.playSuccess();
+      this.closeModal('modal-upload-book');
+      this.showToast(`E-Book "${title}" berhasil disimpan dan dipublikasikan untuk siswa.`, 'success');
+      if (this.currentView === 'admin') await this.renderAdminDashboard(document.getElementById('main-content'));
+      else await this.navigate('library');
+    } catch (err) {
+      console.error('Upload buku gagal:', err);
+      this.showToast(`Buku gagal disimpan: ${err.message}`, 'error');
+    } finally {
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = '<i data-lucide="check" class="w-4 h-4"></i> Publikasikan E-Book'; if (window.lucide) lucide.createIcons(); }
     }
   },
 
